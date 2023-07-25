@@ -6,23 +6,152 @@ run:
 output:
   format: colored-line-number
 linters:
-  enable-all: false
-  disable-all: true
-  enable:
-    - vet
-    - goimports
-    - thelper
-    - tparallel
-    - unconvert
+  enable-all: true
+  disable:
+    # Rules to review
+    - varnamelen
+    - wrapcheck
+    - tagliatelle
+    - paralleltest
+    - nlreturn
+    - gochecknoglobals
+    - exhaustivestruct
+    - forcetypeassert
+    - exhaustive
+    - wsl
+    - scopelint
+    - promlinter
+    - interfacer
+    - godox
+    - godot
+    - errcheck
+    - maintidx
+    - errchkjson
+    - nosnakecase
+    - nonamedreturns
+    - exhaustruct
+    - rowserrcheck
+    - structcheck
     - wastedassign
-    - revive
-    - unused
-    - gofmt
-    - whitespace
-    - misspell
+    - gomoddirectives
+
+    # Following linters should be enabled after fixing the code
+    - cyclop
+    - ireturn
+    - goerr113
+    - prealloc
+    - nestif
+    - lll
+    - maligned
+    - golint
+    - gocognit
+    - funlen
+    - gocyclo
+    - dupl
+    - nolintlint
+    - musttag
+    - interfacebloat
 linters-settings:
+  gofumpt:
+    lang-version: "1.19"
+    extra-rules: true
   revive:
-    ignore-generated-header: true
-    severity: warning
+    severity: error
+    rules:
+      - name: atomic
+      - name: context-as-argument
+      #      - name: context-keys-type #perf issue
+      - name: defer
+      - name: dot-imports
+      - name: empty-block
+      - name: error-naming
+      - name: error-return
+      #      - name: error-strings
+      - name: early-return
+      #      - name: errorf #perf issue
+      #      - name: exported
+      - name: if-return
+      - name: increment-decrement
+      - name: indent-error-flow
+      #      - name: flag-parameter
+      - name: modifies-parameter
+      #      - name: modifies-value-receiver #perf issue
+      - name: package-comments
+      - name: range
+      - name: receiver-naming
+      - name: redefines-builtin-id
+      - name: superfluous-else
+      #      - name: time-naming #perf issue
+      - name: unexported-naming
+      #      - name: var-declaration #perf issue
+      - name: var-naming
+      - name: unused-receiver
+      - name: unused-parameter
+      - name: useless-break
+      - name: unnecessary-stmt
+      - name: unreachable-code
+  goconst:
+    ignore-tests: true
+    numbers: true
+  gomnd:
+    ignored-numbers: # Why we have a big range of file permissions
+      - "0o600"
+      - "0o644"
+      - "0o655"
+      - "0o666"
+      - "0o770"
+      - "0o755"
+      - "0o765"
+      - "0o777"
+    ignored-functions:
+      - "survey.MinLength"
+      - "survey.MaxLength"
+      - "args.Error"
+  gosec:
+    excludes:
+      - G101
+  gosimple:
+    go: "1.19"
+    checks:
+      - "all"
+      - "-S1002"
+  staticcheck:
+    go: "1.19"
+    checks:
+      - "all"
+      - "-SA1019"
+  goimports:
+    local-prefixes: github.com/raystack/optimus
+  gci:
+    sections:
+      - standard # Captures all standard packages if they do not match another section.
+      - default # Contains all imports that could not be matched to another section type.
+      - prefix(github.com/raystack/optimus) # Groups all imports with the specified Prefix.
+  gocritic:
+    disabled-checks:
+      - ifElseChain
+      - singleCaseSwitch
+    enabled-tags:
+      - diagnostic
+      #      - style
+      #      - opinionated
+      - performance
+  unparam:
+    # Inspect exported functions.
+    # XXX: if you enable this setting, unparam will report a lot of false-positives in text editors:
+    check-exported: true
+issues:
+  exclude-rules:
+    # Exclude some linters from running on tests files.
+    - path: _test\.go
+      linters:
+        - gocritic
+        - contextcheck
+    - path: tests
+      linters:
+        - gocritic
+        - gomnd
+        - unparam
+        - testpackage
 severity:
   default-severity: error

@@ -1,4 +1,4 @@
-package slack
+package slack // nolint: testpackage
 
 import (
 	"context"
@@ -8,11 +8,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gorilla/mux"
-	"github.com/odpf/optimus/models"
 	api "github.com/slack-go/slack"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/protobuf/types/known/structpb"
+
+	"github.com/raystack/optimus/core/scheduler"
+	"github.com/raystack/optimus/core/tenant"
 )
 
 func getTestUserProfile() api.UserProfile {
@@ -24,7 +25,7 @@ func getTestUserProfile() api.UserProfile {
 	}
 }
 
-func getTestUserWithId(id string) api.User {
+func getTestUserWithID(id string) api.User {
 	return api.User{
 		ID:                id,
 		Name:              "Test User",
@@ -47,8 +48,12 @@ func getTestUserWithId(id string) api.User {
 }
 
 func TestSlack(t *testing.T) {
+	projectName := "ss"
+	namespaceName := "bb"
+	jobName := scheduler.JobName("foo-job-spec")
+	tnnt, _ := tenant.NewTenant(projectName, namespaceName)
 	t.Run("should send message to user using email address successfully", func(t *testing.T) {
-		muxRouter := mux.NewRouter()
+		muxRouter := http.NewServeMux()
 		server := httptest.NewServer(muxRouter)
 		muxRouter.HandleFunc("/users.lookupByEmail", func(rw http.ResponseWriter, r *http.Request) {
 			rw.Header().Set("Content-Type", "application/json")
@@ -57,7 +62,7 @@ func TestSlack(t *testing.T) {
 				User api.User `json:"user"`
 			}{
 				Ok:   true,
-				User: getTestUserWithId("ABCD"),
+				User: getTestUserWithID("ABCD"),
 			})
 			rw.Write(response)
 		})
@@ -84,26 +89,16 @@ func TestSlack(t *testing.T) {
 			},
 		)
 		defer client.Close()
-		err := client.Notify(context.Background(), models.NotifyAttrs{
-			Namespace: models.NamespaceSpec{
-				Name: "test",
-				ProjectSpec: models.ProjectSpec{
-					Name: "foo",
-					Secret: []models.ProjectSecretItem{
-						{
-							Name:  OAuthTokenSecretName,
-							Value: "test-token",
-						},
-					},
-				},
+		err := client.Notify(context.Background(), scheduler.NotifyAttrs{
+			Owner: "",
+			JobEvent: &scheduler.Event{
+				JobName: jobName,
+				Tenant:  tnnt,
+				Type:    scheduler.SLAMissEvent,
+				Values:  map[string]any{},
 			},
-			JobSpec: models.JobSpec{
-				Name: "foo-job-spec",
-			},
-			JobEvent: models.JobEvent{
-				Type: models.JobEventTypeSLAMiss,
-			},
-			Route: "optimus@test.com",
+			Route:  "optimus@test.com",
+			Secret: "test-token",
 		})
 		assert.Nil(t, err)
 		cancel()
@@ -111,7 +106,7 @@ func TestSlack(t *testing.T) {
 		assert.Nil(t, sendErrors)
 	})
 	t.Run("should send message to user groups successfully", func(t *testing.T) {
-		muxRouter := mux.NewRouter()
+		muxRouter := http.NewServeMux()
 		server := httptest.NewServer(muxRouter)
 		muxRouter.HandleFunc("/usergroups.list", func(rw http.ResponseWriter, r *http.Request) {
 			rw.Header().Set("Content-Type", "application/json")
@@ -167,27 +162,17 @@ func TestSlack(t *testing.T) {
 			"message":   "some failure",
 			"exception": "this much data failed",
 		})
-		err := client.Notify(context.Background(), models.NotifyAttrs{
-			Namespace: models.NamespaceSpec{
-				Name: "test",
-				ProjectSpec: models.ProjectSpec{
-					Name: "foo",
-					Secret: []models.ProjectSecretItem{
-						{
-							Name:  OAuthTokenSecretName,
-							Value: "test-token",
-						},
-					},
-				},
+
+		err := client.Notify(context.Background(), scheduler.NotifyAttrs{
+			Owner: "",
+			JobEvent: &scheduler.Event{
+				JobName: jobName,
+				Tenant:  tnnt,
+				Type:    scheduler.JobFailureEvent,
+				Values:  eventValues.AsMap(),
 			},
-			JobSpec: models.JobSpec{
-				Name: "foo-job-spec",
-			},
-			JobEvent: models.JobEvent{
-				Type:  models.JobEventTypeFailure,
-				Value: eventValues.GetFields(),
-			},
-			Route: "@optimus-devs",
+			Route:  "@optimus-devs",
+			Secret: "test-token",
 		})
 		assert.Nil(t, err)
 		cancel()
@@ -197,6 +182,10 @@ func TestSlack(t *testing.T) {
 }
 
 func TestBuildMessages(t *testing.T) {
+	projectName := "foo"
+	namespaceName := "test"
+	jobName := scheduler.JobName("foo-job-spec")
+	tnnt, _ := tenant.NewTenant(projectName, namespaceName)
 	eventValues := &structpb.Struct{}
 	_ = eventValues.UnmarshalJSON([]byte(`{
             "slas": [
@@ -226,14 +215,13 @@ func TestBuildMessages(t *testing.T) {
 			name: "should parse sla values of sla_miss correctly",
 			args: args{events: []event{
 				{
-					authToken:     "xx",
-					projectName:   "ss",
-					namespaceName: "bb",
-					jobName:       "cc",
-					owner:         "rr",
-					meta: models.JobEvent{
-						Type:  models.JobEventTypeSLAMiss,
-						Value: eventValues.GetFields(),
+					authToken: "xx",
+					owner:     "rr",
+					meta: &scheduler.Event{
+						JobName: jobName,
+						Tenant:  tnnt,
+						Type:    scheduler.SLAMissEvent,
+						Values:  eventValues.AsMap(),
 					},
 				},
 			}},
@@ -242,7 +230,7 @@ func TestBuildMessages(t *testing.T) {
         "type": "header",
         "text": {
             "type": "plain_text",
-            "text": "[Job] SLA Breached | ss/bb",
+            "text": "[Job] SLA Breached | foo/test",
             "emoji": true
         }
     },
@@ -251,7 +239,7 @@ func TestBuildMessages(t *testing.T) {
         "fields": [
             {
                 "type": "mrkdwn",
-                "text": "*Job:*\ncc"
+                "text": "*Job:*\nfoo-job-spec"
             },
             {
                 "type": "mrkdwn",
@@ -271,11 +259,13 @@ func TestBuildMessages(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
+		workerErrChan := make(chan error)
 		t.Run(tt.name, func(t *testing.T) {
-			got := buildMessageBlocks(tt.args.events)
+			got := buildMessageBlocks(tt.args.events, workerErrChan)
 			b, err := json.MarshalIndent(got, "", "    ")
 			assert.Nil(t, err)
 			assert.Equal(t, tt.want, string(b))
 		})
+		assert.Equal(t, len(workerErrChan), 0)
 	}
 }

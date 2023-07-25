@@ -8,23 +8,38 @@ import (
 	"sync"
 	"time"
 
-	"github.com/odpf/optimus/models"
-	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	api "github.com/slack-go/slack"
+
+	"github.com/raystack/optimus/core/scheduler"
 )
 
 const (
-	OAuthTokenSecretName = "NOTIFY_SLACK"
-
 	DefaultEventBatchInterval = time.Second * 10
+	MaxSLAEventsToProcess     = 6
+)
 
-	MaxSLAEventsToProcess = 6
+var (
+	notifierType      = "slack"
+	slackQueueCounter = promauto.NewCounter(prometheus.CounterOpts{
+		Name:        scheduler.MetricNotificationQueue,
+		ConstLabels: map[string]string{"type": notifierType},
+	})
+	slackWorkerBatchCounter = promauto.NewCounter(prometheus.CounterOpts{
+		Name:        scheduler.MetricNotificationWorkerBatch,
+		ConstLabels: map[string]string{"type": notifierType},
+	})
+	slackWorkerSendErrCounter = promauto.NewCounter(prometheus.CounterOpts{
+		Name:        scheduler.MetricNotificationWorkerSendErr,
+		ConstLabels: map[string]string{"type": notifierType},
+	})
 )
 
 type Notifier struct {
 	io.Closer
 
-	slackUrl      string
+	slackURL      string
 	routeMsgBatch map[route][]event // channelID -> [][][][][]
 	wg            sync.WaitGroup
 	mu            sync.Mutex
@@ -39,20 +54,13 @@ type route struct {
 }
 
 type event struct {
-	authToken     string
-	projectName   string
-	namespaceName string
-	jobName       string
-	owner         string
-	meta          models.JobEvent
+	authToken string
+	owner     string
+	meta      *scheduler.Event
 }
 
-func (s *Notifier) Notify(ctx context.Context, attr models.NotifyAttrs) error {
-	oauthSecret, ok := attr.Namespace.ProjectSpec.Secret.GetByName(OAuthTokenSecretName)
-	if !ok {
-		return errors.Errorf("failed to find authentication token of bot required for sending notifications, please register %s secret", OAuthTokenSecretName)
-	}
-	client := api.New(oauthSecret, api.OptionAPIURL(s.slackUrl))
+func (s *Notifier) Notify(ctx context.Context, attr scheduler.NotifyAttrs) error { //nolint: gocritic
+	client := api.New(attr.Secret, api.OptionAPIURL(s.slackURL))
 
 	var receiverIDs []string
 
@@ -68,24 +76,24 @@ func (s *Notifier) Notify(ctx context.Context, attr models.NotifyAttrs) error {
 			groupHandle := strings.TrimLeft(attr.Route, "@")
 			groups, err := client.GetUserGroupsContext(ctx)
 			if err != nil {
-				return errors.Wrapf(err, "client.GetUserGroupsContext")
+				return fmt.Errorf("client.GetUserGroupsContext: %w", err)
 			}
 			var groupID string
-			for _, group := range groups {
-				if group.Handle == groupHandle {
-					groupID = group.ID
+			for i := range groups {
+				if groups[i].Handle == groupHandle {
+					groupID = groups[i].ID
 					break
 				}
 			}
 			receiverIDs, err = client.GetUserGroupMembersContext(ctx, groupID)
 			if err != nil {
-				return errors.Wrapf(err, "client.GetUserGroupMembersContext")
+				return fmt.Errorf("client.GetUserGroupMembersContext: %w", err)
 			}
 		} else {
 			// user email
 			user, err := client.GetUserByEmail(attr.Route)
 			if err != nil {
-				return errors.Wrapf(err, "client.GetUserByEmail")
+				return fmt.Errorf("client.GetUserByEmail: %w", err)
 			}
 			receiverIDs = append(receiverIDs, user.ID)
 		}
@@ -93,14 +101,14 @@ func (s *Notifier) Notify(ctx context.Context, attr models.NotifyAttrs) error {
 
 	// fail if unable to find the receiver ID
 	if len(receiverIDs) == 0 {
-		return errors.Errorf("failed to find notification route %s", attr.Route)
+		return fmt.Errorf("failed to find notification route %s", attr.Route)
 	}
 
-	s.queueNotification(receiverIDs, oauthSecret, attr)
+	s.queueNotification(receiverIDs, attr.Secret, attr)
 	return nil
 }
 
-func (s *Notifier) queueNotification(receiverIDs []string, oauthSecret string, attr models.NotifyAttrs) {
+func (s *Notifier) queueNotification(receiverIDs []string, oauthSecret string, attr scheduler.NotifyAttrs) { //nolint: gocritic
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, receiverID := range receiverIDs {
@@ -113,42 +121,42 @@ func (s *Notifier) queueNotification(receiverIDs []string, oauthSecret string, a
 		}
 
 		evt := event{
-			authToken:     oauthSecret,
-			projectName:   attr.Namespace.ProjectSpec.Name,
-			namespaceName: attr.Namespace.Name,
-			jobName:       attr.JobSpec.Name,
-			owner:         attr.JobSpec.Owner,
-			meta:          attr.JobEvent,
+			authToken: oauthSecret,
+			owner:     attr.Owner,
+			meta:      attr.JobEvent,
 		}
 		s.routeMsgBatch[rt] = append(s.routeMsgBatch[rt], evt)
 	}
+	slackQueueCounter.Inc()
 }
 
 // accumulate messages
-func buildMessageBlocks(events []event) []api.Block {
+func buildMessageBlocks(events []event, workerErrChan chan error) []api.Block {
 	var blocks []api.Block
 
 	// core details related to event
-	for evtIdx, evt := range events {
+	for evtIdx, evt := range events { //nolint: gocritic
 		fieldSlice := make([]*api.TextBlockObject, 0)
-		fieldSlice = append(fieldSlice, api.NewTextBlockObject("mrkdwn", fmt.Sprintf("*Job:*\n%s", evt.jobName), false, false))
-		fieldSlice = append(fieldSlice, api.NewTextBlockObject("mrkdwn", fmt.Sprintf("*Owner:*\n%s", evt.owner), false, false))
+		fieldSlice = append(fieldSlice,
+			api.NewTextBlockObject("mrkdwn", fmt.Sprintf("*Job:*\n%s", evt.meta.JobName), false, false),
+			api.NewTextBlockObject("mrkdwn", fmt.Sprintf("*Owner:*\n%s", evt.owner), false, false))
 
-		switch evt.meta.Type {
-		case models.JobEventTypeSLAMiss:
+		projectName := evt.meta.Tenant.ProjectName().String()
+		namespaceName := evt.meta.Tenant.NamespaceName().String()
+		if evt.meta.Type.IsOfType(scheduler.EventCategorySLAMiss) {
 			heading := api.NewTextBlockObject("plain_text",
-				fmt.Sprintf("[Job] SLA Breached | %s/%s", evt.projectName, evt.namespaceName), true, false)
+				fmt.Sprintf("[Job] SLA Breached | %s/%s", projectName, namespaceName), true, false)
 			blocks = append(blocks, api.NewHeaderBlock(heading))
 
-			if slas, ok := evt.meta.Value["slas"]; ok {
-				for slaIdx, sla := range slas.GetListValue().GetValues() {
-					slaFields := sla.GetStructValue().GetFields()
-					var slaStr = ""
+			if slas, ok := evt.meta.Values["slas"]; ok {
+				for slaIdx, sla := range slas.([]any) {
+					slaFields := sla.(map[string]any)
+					slaStr := ""
 					if taskID, ok := slaFields["task_id"]; ok {
-						slaStr += "\nTask: " + taskID.GetStringValue()
+						slaStr += "\nTask: " + taskID.(string)
 					}
 					if scheduledAt, ok := slaFields["scheduled_at"]; ok {
-						slaStr += "\nScheduled at: " + scheduledAt.GetStringValue()
+						slaStr += "\nScheduled at: " + scheduledAt.(string)
 					}
 					if slaStr != "" {
 						if slaIdx > MaxSLAEventsToProcess {
@@ -163,22 +171,22 @@ func buildMessageBlocks(events []event) []api.Block {
 					}
 				}
 			}
-		case models.JobEventTypeFailure:
+		} else if evt.meta.Type.IsOfType(scheduler.EventCategoryJobFailure) {
 			heading := api.NewTextBlockObject("plain_text",
-				fmt.Sprintf("[Job] Failure | %s/%s", evt.projectName, evt.namespaceName), true, false)
+				fmt.Sprintf("[Job] Failure | %s/%s", projectName, namespaceName), true, false)
 			blocks = append(blocks, api.NewHeaderBlock(heading))
 
-			if scheduledAt, ok := evt.meta.Value["scheduled_at"]; ok && scheduledAt.GetStringValue() != "" {
-				fieldSlice = append(fieldSlice, api.NewTextBlockObject("mrkdwn", fmt.Sprintf("*Scheduled At:*\n%s", scheduledAt.GetStringValue()), false, false))
+			if scheduledAt, ok := evt.meta.Values["scheduled_at"]; ok && scheduledAt.(string) != "" {
+				fieldSlice = append(fieldSlice, api.NewTextBlockObject("mrkdwn", fmt.Sprintf("*Scheduled At:*\n%s", scheduledAt.(string)), false, false))
 			}
-			if duration, ok := evt.meta.Value["duration"]; ok && duration.GetStringValue() != "" {
-				fieldSlice = append(fieldSlice, api.NewTextBlockObject("mrkdwn", fmt.Sprintf("*Duration:*\n%s", duration.GetStringValue()), false, false))
+			if duration, ok := evt.meta.Values["duration"]; ok && duration.(string) != "" {
+				fieldSlice = append(fieldSlice, api.NewTextBlockObject("mrkdwn", fmt.Sprintf("*Duration:*\n%s", duration.(string)), false, false))
 			}
-			if taskID, ok := evt.meta.Value["task_id"]; ok && taskID.GetStringValue() != "" {
-				fieldSlice = append(fieldSlice, api.NewTextBlockObject("mrkdwn", fmt.Sprintf("*Task ID:*\n%s", taskID.GetStringValue()), false, false))
+			if taskID, ok := evt.meta.Values["task_id"]; ok && taskID.(string) != "" {
+				fieldSlice = append(fieldSlice, api.NewTextBlockObject("mrkdwn", fmt.Sprintf("*Task ID:*\n%s", taskID.(string)), false, false))
 			}
-		default:
-			// unknown event
+		} else {
+			workerErrChan <- fmt.Errorf("worker_buildMessageBlocks: unknown event type: %v", evt.meta.Type)
 			continue
 		}
 
@@ -186,29 +194,29 @@ func buildMessageBlocks(events []event) []api.Block {
 		blocks = append(blocks, fieldsSection)
 
 		// event log url button
-		if logURL, ok := evt.meta.Value["log_url"]; ok && logURL.GetStringValue() != "" {
+		if logURL, ok := evt.meta.Values["log_url"]; ok && logURL.(string) != "" {
 			logText := api.NewTextBlockObject("plain_text", "View log :memo:", true, false)
 			logElement := api.NewButtonBlockElement("", "view_log", logText).WithStyle(api.StyleDanger)
-			logElement.URL = logURL.GetStringValue()
+			logElement.URL = logURL.(string)
 			blocks = append(blocks, api.NewActionBlock("", logElement))
 		}
 
 		// event job url button
-		if jobURL, ok := evt.meta.Value["job_url"]; ok && jobURL.GetStringValue() != "" {
+		if jobURL, ok := evt.meta.Values["job_url"]; ok && jobURL.(string) != "" {
 			logText := api.NewTextBlockObject("plain_text", "View job :memo:", true, false)
 			logElement := api.NewButtonBlockElement("", "view_job", logText).WithStyle(api.StyleDanger)
-			logElement.URL = jobURL.GetStringValue()
+			logElement.URL = jobURL.(string)
 			blocks = append(blocks, api.NewActionBlock("", logElement))
 		}
 
 		// build context footer
 		var detailsElementsSlice []api.MixedElement
-		if exception, ok := evt.meta.Value["exception"]; ok && exception.GetStringValue() != "" {
-			optionText := api.NewTextBlockObject("plain_text", fmt.Sprintf("Exception:\n%s", exception.GetStringValue()), true, false)
-			detailsElementsSlice = append(detailsElementsSlice, optionText) //api.NewOptionBlockObject("", optionText, nil))
+		if exception, ok := evt.meta.Values["exception"]; ok && exception.(string) != "" {
+			optionText := api.NewTextBlockObject("plain_text", fmt.Sprintf("Exception:\n%s", exception.(string)), true, false)
+			detailsElementsSlice = append(detailsElementsSlice, optionText) // api.NewOptionBlockObject("", optionText, nil))
 		}
-		if message, ok := evt.meta.Value["message"]; ok && message.GetStringValue() != "" {
-			optionText := api.NewTextBlockObject("plain_text", fmt.Sprintf("Message:\n%s", message.GetStringValue()), true, false)
+		if message, ok := evt.meta.Values["message"]; ok && message.(string) != "" {
+			optionText := api.NewTextBlockObject("plain_text", fmt.Sprintf("Message:\n%s", message.(string)), true, false)
 			detailsElementsSlice = append(detailsElementsSlice, optionText)
 		}
 		if len(detailsElementsSlice) > 0 {
@@ -233,19 +241,19 @@ func (s *Notifier) Worker(ctx context.Context) {
 				continue
 			}
 			var messageOptions []api.MsgOption
-			messageOptions = append(messageOptions, api.MsgOptionBlocks(buildMessageBlocks(events)...))
-			messageOptions = append(messageOptions, api.MsgOptionAsUser(true))
+			messageOptions = append(messageOptions, api.MsgOptionBlocks(buildMessageBlocks(events, s.workerErrChan)...),
+				api.MsgOptionAsUser(true))
 
-			client := api.New(route.authToken, api.OptionAPIURL(s.slackUrl))
+			client := api.New(route.authToken, api.OptionAPIURL(s.slackURL))
 			if _, _, _, err := client.SendMessage(route.receiverID,
 				messageOptions...,
 			); err != nil {
 				cleanedEvents := []event{}
-				for _, ev := range events {
+				for _, ev := range events { //nolint: gocritic
 					ev.authToken = "*redacted*"
 					cleanedEvents = append(cleanedEvents, ev)
 				}
-				s.workerErrChan <- errors.Wrapf(err, "Worker_SendMessageContext: %v", cleanedEvents)
+				s.workerErrChan <- fmt.Errorf("worker_sendMessageContext: %v: %w", cleanedEvents, err)
 			}
 
 			// clear events from map as they are processed
@@ -253,6 +261,7 @@ func (s *Notifier) Worker(ctx context.Context) {
 		}
 		s.mu.Unlock()
 
+		slackWorkerBatchCounter.Inc()
 		select {
 		case <-ctx.Done():
 			close(s.workerErrChan)
@@ -264,17 +273,17 @@ func (s *Notifier) Worker(ctx context.Context) {
 	}
 }
 
-func (s *Notifier) Close() error {
+func (s *Notifier) Close() error { // nolint: unparam
 	// drain batches
 	s.wg.Wait()
 	return nil
 }
 
-func NewNotifier(ctx context.Context, slackUrl string, eventBatchInterval time.Duration, errHandler func(error)) *Notifier {
+func NewNotifier(ctx context.Context, slackURL string, eventBatchInterval time.Duration, errHandler func(error)) *Notifier {
 	this := &Notifier{
-		slackUrl:           slackUrl,
+		slackURL:           slackURL,
 		routeMsgBatch:      map[route][]event{},
-		workerErrChan:      make(chan error, 0),
+		workerErrChan:      make(chan error),
 		eventBatchInterval: eventBatchInterval,
 	}
 
@@ -282,6 +291,7 @@ func NewNotifier(ctx context.Context, slackUrl string, eventBatchInterval time.D
 	go func() {
 		for err := range this.workerErrChan {
 			errHandler(err)
+			slackWorkerSendErrCounter.Inc()
 		}
 		this.wg.Done()
 	}()

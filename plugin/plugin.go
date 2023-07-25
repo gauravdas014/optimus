@@ -2,114 +2,38 @@ package plugin
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
-	"os/exec"
+	"path"
 	"path/filepath"
-	"runtime"
 	"strings"
 
-	"github.com/odpf/optimus/plugin/dependencyresolver"
-
-	"github.com/odpf/optimus/plugin/cli"
-
-	"github.com/odpf/optimus/plugin/base"
-
-	"github.com/pkg/errors"
-
-	"github.com/odpf/optimus/models"
-
 	"github.com/hashicorp/go-hclog"
-	"github.com/hashicorp/go-plugin"
+
+	"github.com/raystack/optimus/internal/models"
+	"github.com/raystack/optimus/plugin/binary"
+	"github.com/raystack/optimus/plugin/v1beta1/dependencyresolver"
+	"github.com/raystack/optimus/plugin/yaml"
+	"github.com/raystack/optimus/sdk/plugin"
 )
 
-func Initialize(pluginLogger hclog.Logger) error {
-	discoveredPlugins, err := DiscoverPlugins(pluginLogger)
-	if err != nil {
-		return errors.Wrap(err, "DiscoverPlugins")
-	}
-	pluginLogger.Debug(fmt.Sprintf("discovering plugins(%d)...", len(discoveredPlugins)))
-
-	// pluginMap is the map of plugins we can dispense.
-	var pluginMap = map[string]plugin.Plugin{
-		models.PluginTypeBase:                     base.NewPluginClient(pluginLogger),
-		models.ModTypeCLI.String():                cli.NewPluginClient(pluginLogger),
-		models.ModTypeDependencyResolver.String(): dependencyresolver.NewPluginClient(pluginLogger),
+func Initialize(pluginLogger hclog.Logger, arg ...string) (*models.PluginRepository, error) {
+	pluginRepository := models.NewPluginRepository()
+	// fetch yaml plugins first, it holds detailed information about the plugin
+	discoveredYamlPlugins := discoverPluginsGivenFilePattern(pluginLogger, yaml.Prefix, yaml.Suffix)
+	pluginLogger.Debug(fmt.Sprintf("discovering yaml   plugins(%d)...", len(discoveredYamlPlugins)))
+	if err := yaml.Init(pluginRepository, discoveredYamlPlugins, pluginLogger); err != nil {
+		return pluginRepository, err
 	}
 
-	for _, pluginPath := range discoveredPlugins {
-		// we are core, start by launching the plugin processes
-		pluginClient := plugin.NewClient(&plugin.ClientConfig{
-			HandshakeConfig:  base.Handshake,
-			Plugins:          pluginMap,
-			Cmd:              exec.Command(pluginPath),
-			Managed:          true,
-			AllowedProtocols: []plugin.Protocol{plugin.ProtocolGRPC},
-			Logger:           pluginLogger,
-		})
+	// fetch binary plugins. Any binary plugin which doesn't have its yaml version will be failed
+	discoveredBinaryPlugins := discoverPluginsGivenFilePattern(pluginLogger, binary.Prefix, binary.Suffix)
+	pluginLogger.Debug(fmt.Sprintf("discovering binary   plugins(%d)...", len(discoveredBinaryPlugins)))
+	err := binary.Init(pluginRepository, discoveredBinaryPlugins, pluginLogger, arg...)
 
-		// connect via GRPC
-		rpcClient, err := pluginClient.Client()
-		if err != nil {
-			return errors.Wrapf(err, "client.Client(): %s", pluginPath)
-		}
-
-		var baseClient models.BasePlugin
-		var cliClient models.CommandLineMod
-		var drClient models.DependencyResolverMod
-
-		// request plugin as base
-		raw, err := rpcClient.Dispense(models.PluginTypeBase)
-		if err != nil {
-			pluginClient.Kill()
-			return errors.Wrapf(err, "rpcClient.Dispense: %s", pluginPath)
-		}
-		baseClient = raw.(models.BasePlugin)
-		baseInfo, err := baseClient.PluginInfo()
-		if err != nil {
-			return errors.Wrapf(err, "failed to read plugin info: %s", pluginPath)
-		}
-		pluginLogger.Debug("plugin connection established: ", baseInfo.Name)
-
-		if modSupported(baseInfo.PluginMods, models.ModTypeCLI) {
-			// create a client with cli mod
-			if rawMod, err := rpcClient.Dispense(models.ModTypeCLI.String()); err == nil {
-				cliClient = rawMod.(models.CommandLineMod)
-				pluginLogger.Debug(fmt.Sprintf("%s mod found for: %s", models.ModTypeCLI, baseInfo.Name))
-			}
-		}
-
-		if modSupported(baseInfo.PluginMods, models.ModTypeDependencyResolver) {
-			// create a client with dependency resolver mod
-			if rawMod, err := rpcClient.Dispense(models.ModTypeDependencyResolver.String()); err == nil {
-				drClient = rawMod.(models.DependencyResolverMod)
-				pluginLogger.Debug(fmt.Sprintf("%s mod found for: %s", models.ModTypeDependencyResolver, baseInfo.Name))
-
-				// cache name
-				drGRPCClient := rawMod.(*dependencyresolver.GRPCClient)
-				drGRPCClient.SetName(baseInfo.Name)
-			}
-		}
-
-		if err := models.PluginRegistry.Add(baseClient, cliClient, drClient); err != nil {
-			return errors.Wrapf(err, "PluginRegistry.Add: %s", pluginPath)
-		}
-		pluginLogger.Debug("plugin ready: ", baseInfo.Name)
-	}
-
-	return nil
+	return pluginRepository, err
 }
 
-func modSupported(mods []models.PluginMod, mod models.PluginMod) bool {
-	for _, m := range mods {
-		if m == mod {
-			return true
-		}
-	}
-	return false
-}
-
-// DiscoverPlugins look for plugin binaries in following folders
+// discoverPluginsGivenFilePattern look for plugin with the specific pattern in following folders
 // order to search is top to down
 // ./
 // <exec>/
@@ -118,38 +42,34 @@ func modSupported(mods []models.PluginMod, mod models.PluginMod) bool {
 // /usr/bin
 // /usr/local/bin
 //
-// for duplicate binaries(even with different versions for now), only the first found will be used
-// sample plugin name: optimus-myplugin_linux_amd64
-func DiscoverPlugins(pluginLogger hclog.Logger) ([]string, error) {
-	var (
-		prefix            = "optimus-"
-		suffix            = fmt.Sprintf("_%s_%s", runtime.GOOS, runtime.GOARCH)
-		discoveredPlugins []string
-	)
+// for duplicate plugins(even with different versions for now), only the first found will be used
+// sample plugin name:
+// - optimus-myplugin_linux_amd64 | with suffix: optimus- and prefix: _linux_amd64
+// - optimus-plugin-myplugin.yaml | with suffix: optimus-plugin and prefix: .yaml
+func discoverPluginsGivenFilePattern(pluginLogger hclog.Logger, prefix, suffix string) []string {
+	var discoveredPlugins, dirs []string
 
-	var dirs []string
-	// current working directory
 	if p, err := os.Getwd(); err == nil {
-		dirs = append(dirs, p)
+		dirs = append(dirs, path.Join(p, PluginsDir), p)
+	} else {
+		pluginLogger.Debug(fmt.Sprintf("Error discovering working dir: %s", err))
 	}
-	{
-		// look in the same directory as the executable
-		if exePath, err := os.Executable(); err != nil {
-			pluginLogger.Debug(fmt.Sprintf("Error discovering exe directory: %s", err))
-		} else {
-			dirs = append(dirs, filepath.Dir(exePath))
-		}
+
+	// look in the same directory as the executable
+	if exePath, err := os.Executable(); err != nil {
+		pluginLogger.Debug(fmt.Sprintf("Error discovering exe directory: %s", err))
+	} else {
+		dirs = append(dirs, filepath.Dir(exePath))
 	}
-	{
-		// add user home directory
-		if currentHomeDir, err := os.UserHomeDir(); err == nil {
-			dirs = append(dirs, filepath.Join(currentHomeDir, ".optimus", "plugins"))
-		}
+
+	// add user home directory
+	if currentHomeDir, err := os.UserHomeDir(); err == nil {
+		dirs = append(dirs, filepath.Join(currentHomeDir, ".optimus", "plugins"))
 	}
 	dirs = append(dirs, []string{"/usr/bin", "/usr/local/bin"}...)
 
 	for _, dirPath := range dirs {
-		fileInfos, err := ioutil.ReadDir(dirPath)
+		fileInfos, err := os.ReadDir(dirPath)
 		if err != nil {
 			continue
 		}
@@ -177,7 +97,7 @@ func DiscoverPlugins(pluginLogger hclog.Logger) ([]string, error) {
 				continue
 			}
 
-			if len(strings.Split(fullName, "-")) < 2 {
+			if len(strings.Split(fullName, "-")) < 2 { //nolint: gomnd
 				continue
 			}
 
@@ -199,7 +119,7 @@ func DiscoverPlugins(pluginLogger hclog.Logger) ([]string, error) {
 			}
 		}
 	}
-	return discoveredPlugins, nil
+	return discoveredPlugins
 }
 
 // Factory returns a new plugin instance
@@ -214,18 +134,10 @@ func Serve(f Factory) {
 	servePlugin(f(logger), logger)
 }
 
-func servePlugin(plugin interface{}, logger hclog.Logger) {
-	switch p := plugin.(type) {
-	case models.DependencyResolverMod:
-		if cliPlugin, ok := plugin.(models.CommandLineMod); ok {
-			dependencyresolver.ServeWithCLI(p, cliPlugin, logger)
-		} else {
-			dependencyresolver.Serve(p, logger)
-		}
-	case models.CommandLineMod:
-		cli.Serve(p, logger)
-	case models.BasePlugin:
-		base.Serve(p, logger)
+func servePlugin(optimusPlugin interface{}, logger hclog.Logger) {
+	switch p := optimusPlugin.(type) {
+	case plugin.DependencyResolverMod:
+		dependencyresolver.Serve(p, logger)
 	default:
 		logger.Error("Unsupported plugin type interface")
 	}

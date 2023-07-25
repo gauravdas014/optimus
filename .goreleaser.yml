@@ -3,7 +3,6 @@ project_name: optimus
 before:
   hooks:
     - make install
-    - make generate
 builds:
   - main: ./main.go
     id: "optimus"
@@ -11,15 +10,13 @@ builds:
     flags:
       - -a
     ldflags:
-      - -s -w -X github.com/odpf/optimus/config.Version={{.Tag}} -X github.com/odpf/optimus/config.BuildCommit={{.FullCommit}} -X github.com/odpf/optimus/config.BuildDate={{.Date}}
+      - -s -w -X github.com/raystack/optimus/config.BuildVersion={{ .Version }} -X github.com/raystack/optimus/config.BuildCommit={{.FullCommit}} -X github.com/raystack/optimus/config.BuildDate={{.Date}}
     goos:
       - linux
       - darwin
       - windows
     goarch:
       - amd64
-      - 386
-      - arm
       - arm64
     env:
       - CGO_ENABLED=0
@@ -28,49 +25,49 @@ archives:
       darwin: macos
       linux: linux
       windows: windows
-      386: i386
       amd64: x86_64
     format_overrides:
       - goos: windows
         format: zip
 release:
-  draft: true
   prerelease: auto
 checksum:
-  name_template: 'checksums.txt'
+  name_template: "checksums.txt"
 snapshot:
   name_template: "{{ .Tag }}-next"
 changelog:
   sort: asc
   filters:
     exclude:
-      - '^docs:'
-      - '^test:'
-      - '^build:'
+      - "^docs"
+      - "^test"
+      - "^build"
+      - "^chore"
 dockers:
-  -
-    goos: linux
+  - goos: linux
     goarch: amd64
     ids:
       - optimus
     dockerfile: Dockerfile
     image_templates:
-      - 'docker.io/odpf/{{.ProjectName}}:latest'
-      - 'docker.io/odpf/{{.ProjectName}}:{{ .Version }}'
-      - 'docker.io/odpf/{{.ProjectName}}:{{ .Tag }}-amd64'
+      - "docker.io/raystack/{{.ProjectName}}:{{ .Version }}"
+      - "docker.io/raystack/{{.ProjectName}}:{{ .Version }}-amd64"
+    extra_files:
+      - entrypoint_init_container.sh
 brews:
   - name: optimus
     tap:
-      owner: odpf
-      name: homebrew-taps
+      owner: raystack
+      name: homebrew-tap
     license: "Apache 2.0"
     description: "Optimus helps your organization to build & manage data pipelines with ease."
-    homepage: https://odpf.github.io/optimus
+    homepage: https://raystack.github.io/optimus
     folder: Formula
+    skip_upload: auto
     dependencies:
       - name: git
     install: |-
       bin.install "optimus"
     commit_author:
-      name: Kush Sharma
-      email: 3647166+kushsharma@users.noreply.github.com
+      name: Ravi Suhag
+      email: suhag.ravi@gmail.com

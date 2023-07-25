@@ -1,0 +1,11 @@
+name: echo
+description: Echo sample plugin for optimus
+plugintype: task
+pluginversion: 0.1.0
+image: docker.io/busybox
+entrypoint: "sleep 10"
+questions:
+- name: HELLO
+  prompt: Hello World
+  help: Example
+  minlength: 3

@@ -1,0 +1,73 @@
+version: 1
+
+# logging configuration
+log:
+  # debug, info, warning, error, fatal - default 'info'
+  level: info
+########################################
+# SERVER CONFIG
+########################################
+
+# for configuring optimus service
+#serve:
+#  # port to listen on
+#  port: 9100
+#
+#  # host to listen on
+#  host: localhost
+#
+#  # this gets injected in compiled dags to reach back out to optimus service
+#  # when they run
+#  ingress_host: optimus.example.io:80
+#
+#  # 32 char hash used for encrypting secrets
+#  # note: use a different one in production please
+#  app_key: Yjo4a0jn1NvYdq79SADC/KaVv9Wu0Ffc
+#
+#  # database configurations
+#  db:
+#    # database connection string
+#    dsn: postgres://user:password@localhost:5432/database?sslmode=disable
+#
+#    min_open_connection: 5
+#    max_open_connection: 10
+
+# optimus supports multiple scheduler types
+#scheduler:
+#  # name of the registered scheduler, default: airflow2
+#  name: airflow2
+
+# application telemetry
+#telemetry:
+#
+#  # configure the host:port used for
+#  # - exposing profiling metrics via pprof over /debug
+#  # - prometheus stats over /metrics
+#  profile_addr: ":9110"
+#
+#  # jaeger collector address to send application traces
+#  jaeger_addr: "http://localhost:14268/api/traces"
+
+# resource managers for job dependency enrichment
+#resource_managers:
+#- name: other_optimus_server
+#  type: optimus # currently, only support optimus type
+#  description: neighbor optimus server
+#  config:
+#    host: # host of other optimus server
+#    headers: # might necessary for authorization
+#
+# plugin:
+#   artifacts:
+#     # refer : https://github.com/hashicorp/go-getter
+#     - ../transformers/dist/transformers_0.1.0_macos_arm64.tar.gz
+#     - https://github.com/raystack/optimus/releases/download/v0.2.5/optimus_0.2.5_linux_arm64.tar.gz
+
+# publisher:
+#   type: kafka
+#   buffer: 8
+#   config:
+#     topic: optimus-events
+#     batch_interval_second: 1
+#     broker_urls:
+#       - localhost:9092
